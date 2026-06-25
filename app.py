@@ -129,11 +129,12 @@ def normalizar_placa(placa):
 
 def normalizar_placa_busqueda(placa):
     """
-    Normaliza la placa únicamente para compararla durante la búsqueda.
-    No cambia cómo se muestra la placa ni cómo se genera el código de pago.
+    Normaliza una placa SOLO para compararla durante la búsqueda.
 
     Ejemplos equivalentes:
     ASB-L3N, ASBL3N, asb l3n
+
+    No cambia cómo se muestra la placa ni cómo se genera el código de pago.
     """
     texto = str(placa or "").strip().upper()
     return "".join(
@@ -167,17 +168,19 @@ def minuto_a_fecha_y_hora(minuto_epoch):
 
 def buscar_placa_en_baserow(placa, token):
     """
-    Busca la fila ABIERTA más reciente de la placa, usando exactamente
-    el formato de tiempo que crea la Raspberry: int(time.time() // 60).
+    Busca la fila ABIERTA más reciente de la placa.
 
-    Solo esta búsqueda fue modificada:
+    La búsqueda:
     - Recorre todas las páginas de Baserow.
-    - Compara placas ignorando guiones, espacios y mayúsculas/minúsculas.
-    - Ignora placas vacías, NaN y registros con tiempo incompatible.
-    - Solo considera filas abiertas (Placa_confirmación vacía).
-    - Elige la fila abierta más reciente por ID.
+    - Compara placas sin depender de guiones, espacios o mayúsculas.
+    - Ignora filas vacías o con NaN.
+    - Solo considera filas con Placa_confirmación vacía.
+    - Usa el formato de tiempo de la Raspberry: minutos Unix.
 
-    No convierte entrada_minuto, no modifica fechas y no cambia el cálculo.
+    Compatibilidad:
+    Si encuentra una fila antigua guardada en segundos Unix, convierte SOLO
+    una copia de esa fila a minutos antes de devolverla. No modifica Baserow,
+    no cambia calcular_pago(), no cambia las fechas y no cambia la tarifa.
     """
     placa_buscada = normalizar_placa_busqueda(placa)
     if not placa_buscada:
@@ -185,6 +188,11 @@ def buscar_placa_en_baserow(placa, token):
 
     campo_placa = resolver_campo("placa", token)
     campo_entrada = resolver_campo("entrada_minuto", token)
+    campo_confirmacion = resolver_campo(
+        "placa_confirmacion",
+        token,
+        obligatorio=False,
+    )
 
     url = f"{BASEROW_API_URL}/api/database/rows/table/{TABLE_ID}/"
     params = {
@@ -192,8 +200,8 @@ def buscar_placa_en_baserow(placa, token):
         "size": 200,
     }
 
-    minuto_actual_raspberry = obtener_minuto_actual()
     candidatas = []
+    minuto_actual_raspberry = obtener_minuto_actual()
 
     while url:
         r = requests.get(
@@ -215,26 +223,56 @@ def buscar_placa_en_baserow(placa, token):
                 fila.get(campo_placa, "")
             )
 
+            if not placa_fila or placa_fila in {"NAN", "NONE", "NULL"}:
+                continue
+
             if placa_fila != placa_buscada:
                 continue
 
-            if not placa_confirmacion_vacia(fila, token):
-                continue
+            if campo_confirmacion:
+                valor_confirmacion = fila.get(campo_confirmacion, "")
+                texto_confirmacion = str(valor_confirmacion or "").strip().lower()
+                if texto_confirmacion not in {"", "nan", "none", "null"}:
+                    continue
 
-            entrada = fila.get(campo_entrada)
+            entrada_original = fila.get(campo_entrada)
 
             try:
-                entrada_numero = int(float(entrada))
+                entrada_numero = int(float(entrada_original))
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            if entrada_numero <= 0:
+                continue
+
+            # La Raspberry actual guarda minutos Unix con time.time() // 60.
+            # Filas antiguas de 10 dígitos están en segundos Unix.
+            # Se adapta únicamente una copia en memoria para que el resto
+            # del archivo siga trabajando exactamente como al inicio.
+            if entrada_numero >= 1_000_000_000:
+                entrada_en_minutos = entrada_numero // 60
+            else:
+                entrada_en_minutos = entrada_numero
+
+            # Evita seleccionar filas con tiempos claramente imposibles.
+            if entrada_en_minutos > minuto_actual_raspberry + 10:
+                continue
+
+            fila_compatible = dict(fila)
+            fila_compatible[campo_entrada] = entrada_en_minutos
+
+            try:
+                row_id = int(fila.get("id", 0) or 0)
             except (TypeError, ValueError):
-                continue
+                row_id = 0
 
-            # La Raspberry crea entrada_minuto con int(time.time() // 60).
-            # Por eso un valor vacío, negativo o mayor que el minuto Unix
-            # actual no corresponde al formato que usa este flujo.
-            if entrada_numero <= 0 or entrada_numero > minuto_actual_raspberry:
-                continue
-
-            candidatas.append(fila)
+            candidatas.append(
+                (
+                    entrada_en_minutos,
+                    row_id,
+                    fila_compatible,
+                )
+            )
 
         url = data.get("next")
         params = None
@@ -242,14 +280,13 @@ def buscar_placa_en_baserow(placa, token):
     if not candidatas:
         return None
 
-    def id_fila(fila):
-        try:
-            return int(fila.get("id", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+    # Primero la entrada más reciente; en empate, el ID más alto.
+    candidatas.sort(
+        key=lambda elemento: (elemento[0], elemento[1]),
+        reverse=True,
+    )
 
-    candidatas.sort(key=id_fila, reverse=True)
-    return candidatas[0]
+    return candidatas[0][2]
 
 def actualizar_minuto_actual(row_id, minuto_actual, token):
     campo_minuto_actual = resolver_campo("minuto_actual", token)
