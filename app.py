@@ -124,17 +124,20 @@ def baserow_headers(token, json=True):
 # ============================================================
 
 def normalizar_placa(placa):
-    return str(placa).strip().upper().replace(" ", "")
+    """
+    Normaliza únicamente el valor de Numero_Placas para comparar placas.
 
+    Ejemplos que se consideran iguales:
+    - ASB-L3N
+    - ASB L3N
+    - ASBL3N
+    - asb-l3n
 
-def normalizar_placa_busqueda(placa):
-    """Normaliza solo para comparar placas durante la búsqueda."""
-    texto = str(placa or "").strip().upper()
-    return "".join(
-        caracter
-        for caracter in texto
-        if caracter.isascii() and caracter.isalnum()
-    )
+    No modifica el valor guardado en Baserow; solo crea una versión de
+    comparación formada por letras y números en mayúscula.
+    """
+    placa = quitar_tildes(str(placa or "")).upper().strip()
+    return "".join(caracter for caracter in placa if caracter.isalnum())
 
 
 def pago_esta_pagado(valor):
@@ -161,19 +164,28 @@ def minuto_a_fecha_y_hora(minuto_epoch):
 
 def buscar_placa_en_baserow(placa, token):
     """
-    Busca la fila ABIERTA más reciente de la placa.
+    Recorre TODA la tabla de Baserow y busca la fila ABIERTA de la placa.
 
-    Solo mejora la búsqueda:
-    - Recorre todas las páginas de Baserow.
-    - Compara sin importar guiones, espacios o mayúsculas.
-    - Mantiene intacto entrada_minuto y todo el manejo del tiempo.
+    La comparación se hace únicamente sobre Numero_Placas y acepta que la
+    misma placa esté escrita con o sin guion, con espacios o en minúsculas.
+
+    Abierta significa:
+    - Numero_Placas coincide después de normalizarlo.
+    - Placa_confirmación está vacía.
     """
-    placa_buscada = normalizar_placa_busqueda(placa)
+    placa_buscada = normalizar_placa(placa)
     if not placa_buscada:
         return None
 
     campo_placa = resolver_campo("placa", token)
+    campo_entrada = resolver_campo("entrada_minuto", token)
+    campo_placa_confirmacion = resolver_campo(
+        "placa_confirmacion", token, obligatorio=True
+    )
 
+    # No se usa el parámetro "search" de Baserow porque puede dejar fuera
+    # registros escritos con otro separador. Se descargan todas las páginas
+    # y la comparación exacta se realiza localmente después de normalizar.
     url = f"{BASEROW_API_URL}/api/database/rows/table/{TABLE_ID}/"
     params = {"user_field_names": "true", "size": 200}
 
@@ -186,44 +198,41 @@ def buscar_placa_en_baserow(placa, token):
             params=params,
             timeout=15,
         )
-
         if r.status_code != 200:
-            raise Exception(
-                f"Error consultando Baserow: {r.status_code} - {r.text}"
-            )
+            raise Exception(f"Error consultando Baserow: {r.status_code} - {r.text}")
 
         data = r.json()
 
         for fila in data.get("results", []):
-            placa_fila = normalizar_placa_busqueda(
-                fila.get(campo_placa, "")
+            placa_fila = normalizar_placa(fila.get(campo_placa, ""))
+            confirmacion = fila.get(campo_placa_confirmacion, "")
+            confirmacion_vacia = (
+                confirmacion is None or str(confirmacion).strip() == ""
             )
 
-            if not placa_fila or placa_fila in {"NAN", "NONE", "NULL"}:
-                continue
-
-            if placa_fila != placa_buscada:
-                continue
-
-            if placa_confirmacion_vacia(fila, token):
+            if placa_fila == placa_buscada and confirmacion_vacia:
                 abiertas.append(fila)
 
         url = data.get("next")
         params = None
 
-    if not abiertas:
-        return None
-
     def clave_orden(fila):
-        entrada = fila.get(resolver_campo("entrada_minuto", token), 0)
+        entrada = fila.get(campo_entrada, 0)
         try:
             entrada = int(float(entrada or 0))
-        except Exception:
+        except (TypeError, ValueError):
             entrada = 0
-        return (entrada, int(fila.get("id", 0)))
+
+        try:
+            row_id = int(fila.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+
+        return (entrada, row_id)
 
     abiertas.sort(key=clave_orden, reverse=True)
-    return abiertas[0]
+    return abiertas[0] if abiertas else None
+
 
 def actualizar_minuto_actual(row_id, minuto_actual, token):
     campo_minuto_actual = resolver_campo("minuto_actual", token)
