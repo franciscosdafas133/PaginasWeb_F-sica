@@ -124,58 +124,23 @@ def baserow_headers(token, json=True):
 # ============================================================
 
 def normalizar_placa(placa):
-    """Normaliza la placa sin depender de guiones, espacios o mayúsculas."""
-    texto = str(placa or "").upper().strip()
+    return str(placa).strip().upper().replace(" ", "")
 
-    # Ignorar filas vacías o valores NaN/None provenientes de Baserow.
-    if texto in {"", "NAN", "NONE", "NULL"}:
-        return ""
 
+def normalizar_placa_busqueda(placa):
+    """
+    Normaliza la placa únicamente para compararla durante la búsqueda.
+    No cambia cómo se muestra la placa ni cómo se genera el código de pago.
+
+    Ejemplos equivalentes:
+    ASB-L3N, ASBL3N, asb l3n
+    """
+    texto = str(placa or "").strip().upper()
     return "".join(
-        caracter for caracter in texto
+        caracter
+        for caracter in texto
         if caracter.isascii() and caracter.isalnum()
     )
-
-
-def variantes_placa(placa):
-    """
-    Genera formas equivalentes de una placa.
-
-    Ejemplos que se consideran iguales:
-    NGX-068, NGX 068, ngx068 y 068-NGX.
-    Se conserva el orden interno de cada bloque para no confundir placas
-    alfanuméricas como ASB-L3N.
-    """
-    texto = str(placa or "").upper().strip()
-    normal = normalizar_placa(texto)
-    variantes = {normal} if normal else set()
-
-    # Separar bloques usando cualquier carácter que no sea letra o número.
-    bloques = []
-    bloque_actual = []
-    for caracter in texto:
-        if caracter.isascii() and caracter.isalnum():
-            bloque_actual.append(caracter)
-        elif bloque_actual:
-            bloques.append("".join(bloque_actual))
-            bloque_actual = []
-    if bloque_actual:
-        bloques.append("".join(bloque_actual))
-
-    # Si hay dos bloques explícitos, aceptar también el orden inverso.
-    if len(bloques) == 2:
-        variantes.add(normalizar_placa(bloques[1] + bloques[0]))
-
-    # También cubrir placas clásicas de tres letras y tres números sin separador.
-    if len(normal) == 6:
-        primera = normal[:3]
-        segunda = normal[3:]
-        if (primera.isalpha() and segunda.isdigit()) or (
-            primera.isdigit() and segunda.isalpha()
-        ):
-            variantes.add(segunda + primera)
-
-    return variantes
 
 
 def pago_esta_pagado(valor):
@@ -188,38 +153,12 @@ def placa_confirmacion_vacia(fila, token):
     return valor is None or str(valor).strip() == ""
 
 
-def valor_epoch_es_segundos(valor):
-    """Detecta si el valor está guardado como epoch en segundos."""
-    try:
-        numero = int(float(valor))
-        return numero >= 100_000_000
-    except Exception:
-        return False
-
-
-def convertir_epoch_a_minutos(valor):
-    """Convierte epoch en segundos o minutos a minutos para calcular."""
-    numero = int(float(valor))
-    if valor_epoch_es_segundos(numero):
-        return numero // 60
-    return numero
-
-
 def obtener_minuto_actual():
     return int(time.time() // 60)
 
 
-def obtener_actual_misma_unidad(valor_referencia):
-    """Devuelve el tiempo actual en la misma unidad que entrada_minuto."""
-    if valor_epoch_es_segundos(valor_referencia):
-        return int(time.time())
-    return obtener_minuto_actual()
-
-
-def minuto_a_fecha_y_hora(valor_epoch):
-    """Convierte correctamente epoch en segundos o epoch en minutos."""
-    minutos_epoch = convertir_epoch_a_minutos(valor_epoch)
-    segundos = minutos_epoch * 60
+def minuto_a_fecha_y_hora(minuto_epoch):
+    segundos = minuto_epoch * 60
     estructura_tiempo = time.localtime(segundos)
     fecha = time.strftime("%d/%m/%Y", estructura_tiempo)
     hora = time.strftime("%I:%M %p", estructura_tiempo).lstrip("0")
@@ -228,28 +167,34 @@ def minuto_a_fecha_y_hora(valor_epoch):
 
 def buscar_placa_en_baserow(placa, token):
     """
-    Busca una placa sin depender de guiones, espacios, mayúsculas,
-    del orden de los bloques ni del orden de las filas en Baserow.
+    Busca la fila ABIERTA más reciente de la placa, usando exactamente
+    el formato de tiempo que crea la Raspberry: int(time.time() // 60).
 
-    Primero prioriza el registro abierto más reciente. Si no existe uno
-    abierto, devuelve el registro coincidente más reciente.
+    Solo esta búsqueda fue modificada:
+    - Recorre todas las páginas de Baserow.
+    - Compara placas ignorando guiones, espacios y mayúsculas/minúsculas.
+    - Ignora placas vacías, NaN y registros con tiempo incompatible.
+    - Solo considera filas abiertas (Placa_confirmación vacía).
+    - Elige la fila abierta más reciente por ID.
+
+    No convierte entrada_minuto, no modifica fechas y no cambia el cálculo.
     """
-    variantes_buscadas = variantes_placa(placa)
-    if not variantes_buscadas:
+    placa_buscada = normalizar_placa_busqueda(placa)
+    if not placa_buscada:
         return None
 
     campo_placa = resolver_campo("placa", token)
     campo_entrada = resolver_campo("entrada_minuto", token)
-    campo_confirmacion = resolver_campo(
-        "placa_confirmacion", token, obligatorio=False
-    )
 
-    # No se usa el parámetro search de Baserow porque esa búsqueda es literal
-    # y puede omitir NGX-068 cuando el usuario escribe NGX068, o viceversa.
     url = f"{BASEROW_API_URL}/api/database/rows/table/{TABLE_ID}/"
-    params = {"user_field_names": "true", "size": 200}
+    params = {
+        "user_field_names": "true",
+        "size": 200,
+    }
 
-    coincidencias = []
+    minuto_actual_raspberry = obtener_minuto_actual()
+    candidatas = []
+
     while url:
         r = requests.get(
             url,
@@ -257,50 +202,54 @@ def buscar_placa_en_baserow(placa, token):
             params=params,
             timeout=15,
         )
+
         if r.status_code != 200:
             raise Exception(
                 f"Error consultando Baserow: {r.status_code} - {r.text}"
             )
 
         data = r.json()
+
         for fila in data.get("results", []):
-            variantes_fila = variantes_placa(fila.get(campo_placa, ""))
-            if variantes_buscadas.intersection(variantes_fila):
-                coincidencias.append(fila)
+            placa_fila = normalizar_placa_busqueda(
+                fila.get(campo_placa, "")
+            )
+
+            if placa_fila != placa_buscada:
+                continue
+
+            if not placa_confirmacion_vacia(fila, token):
+                continue
+
+            entrada = fila.get(campo_entrada)
+
+            try:
+                entrada_numero = int(float(entrada))
+            except (TypeError, ValueError):
+                continue
+
+            # La Raspberry crea entrada_minuto con int(time.time() // 60).
+            # Por eso un valor vacío, negativo o mayor que el minuto Unix
+            # actual no corresponde al formato que usa este flujo.
+            if entrada_numero <= 0 or entrada_numero > minuto_actual_raspberry:
+                continue
+
+            candidatas.append(fila)
 
         url = data.get("next")
         params = None
 
-    if not coincidencias:
+    if not candidatas:
         return None
 
-    def clave_orden(fila):
-        entrada = fila.get(campo_entrada, 0)
+    def id_fila(fila):
         try:
-            # Comparar todas las filas en la misma unidad, aunque unas
-            # estén guardadas en segundos y otras en minutos.
-            entrada = convertir_epoch_a_minutos(entrada)
-        except Exception:
-            entrada = 0
-        try:
-            row_id = int(fila.get("id", 0) or 0)
-        except Exception:
-            row_id = 0
-        return entrada, row_id
+            return int(fila.get("id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
 
-    # El orden visual de Baserow no afecta el resultado.
-    coincidencias.sort(key=clave_orden, reverse=True)
-
-    # Mantener la prioridad original: usar primero una estancia todavía abierta.
-    if campo_confirmacion:
-        for fila in coincidencias:
-            valor = fila.get(campo_confirmacion, "")
-            if valor is None or str(valor).strip() == "":
-                return fila
-
-    # Si todas ya tienen confirmación, devolver igualmente la más reciente.
-    return coincidencias[0]
-
+    candidatas.sort(key=id_fila, reverse=True)
+    return candidatas[0]
 
 def actualizar_minuto_actual(row_id, minuto_actual, token):
     campo_minuto_actual = resolver_campo("minuto_actual", token)
@@ -351,46 +300,37 @@ def calcular_pago(fila, token):
     campo_pago = resolver_campo("confirmacion_pago", token, obligatorio=False)
 
     placa = fila.get(campo_placa, "")
-    entrada_guardada = fila.get(campo_entrada)
+    entrada_minuto = fila.get(campo_entrada)
 
-    if entrada_guardada in [None, ""]:
+    if entrada_minuto in [None, ""]:
         raise Exception("La placa existe, pero el campo entrada_minuto está vacío.")
 
-    # En Baserow hay registros en segundos, por ejemplo 1782324900,
-    # y registros antiguos en minutos. Para calcular, ambos se llevan
-    # internamente a minutos sin alterar el formato guardado de la fila.
-    entrada_guardada = int(float(entrada_guardada))
-    entrada_en_minutos = convertir_epoch_a_minutos(entrada_guardada)
-
-    minuto_actual_en_minutos = obtener_minuto_actual()
-    minuto_actual_guardado = obtener_actual_misma_unidad(entrada_guardada)
-    minutos_estacionado = minuto_actual_en_minutos - entrada_en_minutos
+    entrada_minuto = int(float(entrada_minuto))
+    minuto_actual = obtener_minuto_actual()
+    minutos_estacionado = minuto_actual - entrada_minuto
 
     if minutos_estacionado < 0:
         return {
             "ok": False,
             "row_id": row_id,
             "placa": placa,
-            "entrada_minuto": entrada_guardada,
-            "minuto_actual": minuto_actual_guardado,
+            "entrada_minuto": entrada_minuto,
+            "minuto_actual": minuto_actual,
             "minutos_estacionado": minutos_estacionado,
         }
 
     horas_cobradas = calcular_horas_cobradas(minutos_estacionado)
     monto = horas_cobradas * TARIFA_HORA
-    codigo_pago = (
-        f"PARK-{normalizar_placa(placa)}-{row_id}-{minuto_actual_guardado}"
-    )
+    codigo_pago = f"PARK-{normalizar_placa(placa)}-{row_id}-{minuto_actual}"
 
-    # Se escribe minuto_actual usando la misma unidad que entrada_minuto.
-    actualizar_minuto_actual(row_id, minuto_actual_guardado, token)
+    actualizar_minuto_actual(row_id, minuto_actual, token)
 
     return {
         "ok": True,
         "row_id": row_id,
         "placa": placa,
-        "entrada_minuto": entrada_guardada,
-        "minuto_actual": minuto_actual_guardado,
+        "entrada_minuto": entrada_minuto,
+        "minuto_actual": minuto_actual,
         "minutos_estacionado": minutos_estacionado,
         "horas_transcurridas": minutos_estacionado // 60,
         "minutos_restantes": minutos_estacionado % 60,
