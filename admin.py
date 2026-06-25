@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # CONFIGURACION BASEROW
@@ -20,6 +21,10 @@ HEADERS = {
 # ==========================================
 
 TARIFA_HORA = 4
+
+# Zona horaria del proyecto. Esto evita que Streamlit Cloud muestre
+# la hora UTC en vez de la hora local de Perú.
+ZONA_HORARIA = ZoneInfo("America/Lima")
 
 # ==========================================
 # LOGIN ADMIN
@@ -129,17 +134,33 @@ def obtener_datos():
 
 
 # ==========================================
-# HELPERS DE FECHA — usan listas, nunca apply
-# sobre columnas datetime de pandas (evita NaT)
+# HELPERS DE FECHA — reciben minutos Unix desde Raspberry
+# y usan listas, nunca apply sobre datetime de pandas
 # ==========================================
 
 def epoch_a_dt(valor):
-    """Segundos epoch → datetime Python nativo. Devuelve None si falla."""
+    """
+    Minutos Unix → datetime Python nativo.
+
+    La Raspberry guarda entrada_minuto y minuto_actual con:
+        int(time.time() // 60)
+
+    Por eso, antes de convertir a fecha, se multiplica por 60
+    para recuperar los segundos Unix.
+    """
     try:
-        ts = int(float(valor))
-        if ts <= 0:
+        minutos_epoch = int(float(valor))
+        if minutos_epoch <= 0:
             return None
-        return datetime.fromtimestamp(ts)
+
+        segundos_epoch = minutos_epoch * 60
+
+        # Se convierte explícitamente a la hora de Perú y después se deja
+        # como datetime sin zona para mantener compatibles los filtros actuales.
+        return datetime.fromtimestamp(
+            segundos_epoch,
+            tz=ZONA_HORARIA
+        ).replace(tzinfo=None)
     except Exception:
         return None
 
@@ -176,11 +197,19 @@ def fmt_dia(dt):
 # ==========================================
 
 def calcular_monto(entrada_epoch, salida_epoch):
+    """
+    Calcula el monto usando valores guardados en minutos Unix.
+
+    Se conserva la misma lógica de redondeo que tenía este dashboard;
+    únicamente se corrige la unidad de segundos a minutos.
+    """
     try:
-        entrada  = int(float(entrada_epoch))
-        salida   = int(float(salida_epoch))
-        segundos = max(salida - entrada, 0)
-        horas    = max(round(segundos / 3600), 1)
+        entrada = int(float(entrada_epoch))
+        salida = int(float(salida_epoch))
+
+        minutos = max(salida - entrada, 0)
+        horas = max(round(minutos / 60), 1)
+
         return horas * TARIFA_HORA
     except Exception:
         return 0
@@ -193,7 +222,7 @@ def calcular_monto(entrada_epoch, salida_epoch):
 def procesar_df(df):
     df = df.copy()
 
-    # Convertir epoch a lista de datetime nativos (nunca pandas datetime → nunca NaT)
+    # Convertir minutos Unix a datetime nativo
     entradas = [epoch_a_dt(v) for v in df["entrada_minuto"]]
     salidas  = [epoch_a_dt(v) for v in df["minuto_actual"]]
 
